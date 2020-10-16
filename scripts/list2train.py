@@ -6,7 +6,7 @@ sys.path.append('')
 
 
 def _is_complete_corpus(filename):
-    from cube.io_utils.conll import Dataset
+    from cube2.io_utils.conll import Dataset
     dataset = Dataset()
     dataset.load_language(filename, 0)
     ok = False
