@@ -18,7 +18,7 @@
 
 import sys
 import re
-from cube.misc.misc import fopen
+from cube2.io_utils.misc import fopen
 
 
 class Encodings(object):
