@@ -35,6 +35,7 @@ class MLM(nn.Module):
         self._encodings = encodings
         self._start = len(self._encodings.word2int)
         self._end = len(self._encodings.word2int) + 1
+        self._unk = self._encodings.word2int['<UNK>']
 
         self._word_lookup = nn.Embedding(len(encodings.word2int) + 2, config.word_emb_size)
         self._lang_lookup = nn.Embedding(config.num_languages, config.lang_emb_size)
@@ -46,7 +47,7 @@ class MLM(nn.Module):
 
         self._proj = nn.Linear(config.rnn_layer_size * 2 + config.lang_emb_size, config.proj_size)
 
-        self._output = nn.Linear(config.proj_size, len(encodings.word2int))
+        self._output = nn.Linear(config.proj_size + config.lang_emb_size, len(encodings.word2int))
         self._pad = nn.Embedding(1, config.word_emb_size)
 
         self._encodigs = encodings
@@ -59,8 +60,8 @@ class MLM(nn.Module):
         x_langs_tmp = x_langs.unsqueeze(1).repeat(1, x_words.shape[1], 1)
         x = torch.cat([x_words, x_langs_tmp], dim=-1)
         x_fw, _ = self._fw_rnn(x)
-        x_bw, _ = torch.flip(self._bw_rnn(torch.flip(x, [1])), [1])
-        x_langs = x_langs.unsqueeze(1).repeat(1, x_words.shape[1] - 2)
+        x_bw = torch.flip(self._bw_rnn(torch.flip(x, [1]))[0], [1])
+        x_langs = x_langs.unsqueeze(1).repeat(1, x_words.shape[1] - 2, 1)
         x_cat = torch.cat([x_langs, x_fw[:, :-2, :], x_bw[:, 2:, :]], dim=-1)
         x_proj = self._proj(x_cat)
         if self.training:
@@ -78,21 +79,35 @@ class MLM(nn.Module):
             for jj in range(len(sents[ii])):
                 word = sents[ii][jj].lower()
                 if word in self._encodigs.word2int:
-                    sents[ii, jj + 1] = self._encodigs.word2int[word]
+                    x_words[ii, jj + 1] = self._encodigs.word2int[word]
+                else:
+                    x_words[ii, jj + 1] = self._unk
             x_words[ii, len(sents[ii]) + 1] = self._end
         x_words = torch.tensor(x_words, device=self._get_device(), dtype=torch.long)
         return x_words, x_langs
 
     def _get_device(self):
-        if self.case_emb.weight.device.type == 'cpu':
+        if self._word_lookup.weight.device.type == 'cpu':
             return 'cpu'
-        return '{0}:{1}'.format(self.case_emb.weight.device.type, str(self.case_emb.weight.device.index))
+        return '{0}:{1}'.format(self._word_lookup.weight.device.type, str(self._word_lookup.weight.device.index))
 
     def save(self, path):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
         self.load_state_dict(torch.load(path, map_location='cpu'))
+
+
+def _make_batch(examples):
+    sents = []
+    langs = []
+    for example in examples:
+        langs.append(example[1])
+        sent = []
+        for token in example[0]:
+            sent.append(token.word)
+        sents.append(sent)
+    return sents, langs
 
 
 def _eval(model, dataset, encodings):
@@ -122,31 +137,25 @@ def _start_train(params, trainset, devset, encodings, model, criterion, optimize
         for batch_idx in pgb:
             start = batch_idx * params.batch_size
             stop = min(len(trainset.sequences), start + params.batch_size)
-            # data = []
-            # lang_ids = []
-            # for ii in range(stop - start):
-            #     data.append(trainset.sequences[start + ii][0])
-            #     lang_ids.append(trainset.sequences[start + ii][1])
-            #     total_words += len(trainset.sequences[start + ii][0])
-            #
-            # s_upos, s_xpos, s_attrs, s_aux_upos, s_aux_xpos, s_aux_attrs = tagger(data, lang_ids=lang_ids)
-            # tgt_upos, tgt_xpos, tgt_attrs = _get_tgt_labels(data, encodings, device=params.device)
-            # loss = (criterion(s_upos.view(-1, s_upos.shape[-1]), tgt_upos.view(-1)) +
-            #         criterion(s_xpos.view(-1, s_xpos.shape[-1]), tgt_xpos.view(-1)) +
-            #         criterion(s_attrs.view(-1, s_attrs.shape[-1]), tgt_attrs.view(-1))) * 0.34
-            #
-            # loss_aux = ((criterion(s_aux_upos.view(-1, s_aux_upos.shape[-1]), tgt_upos.view(-1)) +
-            #              criterion(s_aux_xpos.view(-1, s_aux_xpos.shape[-1]), tgt_xpos.view(-1)) +
-            #              criterion(s_aux_attrs.view(-1, s_aux_attrs.shape[-1]), tgt_attrs.view(-1))) * 0.34) * \
-            #            tagger.config.aux_softmax_weight
-            #
-            # loss = loss + loss_aux
-            # trainer.zero_grad()
-            # loss.backward()
-            # torch.nn.utils.clip_grad_norm_(tagger.parameters(), 5.)
-            # trainer.step()
-            # epoch_loss += loss.item()
-            # pgb.set_description('\tloss={0:.4f}'.format(loss.item()))
+            sents, langs = _make_batch(trainset.sequences[start:stop])
+            y_pred = model(sents, langs)
+            y_tar = []
+            y_pred_list = []
+            for ii in range(len(sents)):
+                for jj in range(len(sents[ii])):
+                    word = sents[ii][jj].lower()
+                    if word in encodings.word2int:
+                        y_tar.append(encodings.word2int[word])
+                        y_pred_list.append(y_pred[ii, jj, :].unsqueeze(0))
+            y_tar = torch.tensor(y_tar, device=params.device, dtype=torch.long)
+            y_pred = torch.cat(y_pred_list, dim=0)
+            loss = criterion(y_pred, y_tar)
+            optimizer.zero_grad()
+            loss.backward()
+            epoch_loss += loss.item()
+            optimizer.step()
+            pgb.set_description('\tloss={0:.4f}'.format(loss.item()))
+
         nll = _eval(model, devset, encodings)
         sys.stdout.write('\tStoring {0}.last\n'.format(params.store))
         sys.stdout.flush()
