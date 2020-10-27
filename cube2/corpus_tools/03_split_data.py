@@ -46,7 +46,7 @@ if __name__ == '__main__':
 
     (params, _) = parser.parse_args(sys.argv)
 
-    if params.input_file and params.output_file:
+    if params.input_file and params.output_base:
         _split_file(params)
     else:
         parser.print_help()
