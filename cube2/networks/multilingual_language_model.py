@@ -23,7 +23,6 @@ sys.path.append('')
 import torch.nn as nn
 from cube2.io_utils.encodings import Encodings
 from cube2.io_utils.config import MLMConfig
-from cube2.io_utils.conll import ConllEntry
 import numpy as np
 import optparse
 import random
@@ -34,78 +33,134 @@ from tqdm import tqdm
 class Dataset:
     def __init__(self):
         self.sequences = []
+        self.lang2cluster = {}
 
     def load_dataset(self, filename, lang_id):
         lines = open(filename).readlines()
-        for line in tqdm(lines):
+        for line in tqdm(lines, desc='\t{0}'.format(filename), ncols=100):
             parts = line.strip().split(' ')
             self.sequences.append([parts, lang_id])
 
+    def load_clusters(self, filename, lang_id):
+        lines = open(filename).readlines()
+        self.lang2cluster[lang_id] = {}
+        for ii in tqdm(range(len(lines) // 4), desc='\t{0}'.format(filename), ncols=100):
+            self.lang2cluster[lang_id][ii] = lines[ii * 4 + 1].split(' ')
 
-class MLM(nn.Module):
-    def __init__(self, encodings: Encodings, config: MLMConfig):
-        super(MLM, self).__init__()
-        # _start and _end encodings
-        self._encodings = encodings
-        self._start = len(self._encodings.word2int)
-        self._end = len(self._encodings.word2int) + 1
-        self._unk = self._encodings.word2int['<UNK>']
 
-        self._word_lookup = nn.Embedding(len(encodings.word2int) + 2, config.word_emb_size)
-        self._lang_lookup = nn.Embedding(config.num_languages, config.lang_emb_size)
-        self._fw_rnn = nn.LSTM(config.word_emb_size + config.lang_emb_size, config.rnn_layer_size,
-                               num_layers=config.rnn_layers, batch_first=True)
+class Encodings:
+    def __init__(self, filename=None):
+        self._token2int = {}
+        self._char2int = {}
+        self._num_langs = 0
+        self._word2target = {}
+        self._max_clusters = 0
+        self._max_words_in_clusters = 0
+        if filename is not None:
+            self.load(filename)
 
-        self._bw_rnn = nn.LSTM(config.word_emb_size + config.lang_emb_size, config.rnn_layer_size,
-                               num_layers=config.rnn_layers, batch_first=True)
+    def save(self, filename):
+        json_obj = {'num_langs': self._num_langs, 'max_clusters': self._max_clusters,
+                    'max_words_in_clusters': self._max_words_in_clusters, 'token2int': self._token2int,
+                    'char2int': self._char2int, '_word2target': self._word2target}
+        json.dump(json_obj, open(filename, 'w'))
 
-        self._proj = nn.Linear(config.rnn_layer_size * 2 + config.lang_emb_size, config.proj_size)
+    def load(self, filename):
+        json_obj = json.load(open(filename))
+        self._token2int = json_obj['token2int']
+        self._char2int = json_obj['char2int']
+        self._num_langs = json_obj['num_langs']
+        self._word2target = json_obj['word2target']
+        self._max_clusters = json_obj['max_clusters']
+        self._max_words_in_clusters = json_obj['max_words_in_clusters']
 
-        output_size = np.log(len(encodings.word2int))
-        if output_size - int(output_size) > 0:
-            output_size += 1
-        output_size = int(output_size)
-        self._output = nn.Linear(config.proj_size + config.lang_emb_size, output_size)
-        self._pad = nn.Embedding(1, config.word_emb_size)
-
-        self._encodigs = encodings
-        self._config = config
-
-    def forward(self, sentences, languages, return_out=False):
-        x_words, x_langs = self._make_data(sentences, languages)
-        x_words = self._word_lookup(x_words)
-        x_langs = self._lang_lookup(x_langs)
-        x_langs_tmp = x_langs.unsqueeze(1).repeat(1, x_words.shape[1], 1)
-        x = torch.cat([x_words, x_langs_tmp], dim=-1)
-        x = torch.dropout(x, 0.5, self.training)
-        x_fw, _ = self._fw_rnn(x)
-        x_bw = torch.flip(self._bw_rnn(torch.flip(x, [1]))[0], [1])
-        x_langs = x_langs.unsqueeze(1).repeat(1, x_words.shape[1] - 2, 1)
-        x_cat = torch.cat([x_langs, x_fw[:, :-2, :], x_bw[:, 2:, :]], dim=-1)
-        x_cat = torch.dropout(x_cat, 0.5, self.training)
-        x_proj = torch.tanh(self._proj(x_cat))
-        if return_out:
-            x_cat2 = torch.cat([x_proj, x_langs], dim=-1)
-            x_cat2 = torch.dropout(x_cat2, 0.5, self.training)
-            return torch.sigmoid(self._output(x_cat2))
-        else:
-            return x_proj
-
-    def _make_data(self, sents, langs):
-        x_langs = torch.tensor(langs, device=self._get_device(), dtype=torch.long)
-        max_words = max([len(sent) for sent in sents])
-        x_words = np.zeros((len(sents), max_words + 2), dtype=np.long)
-        for ii in range(len(sents)):
-            x_words[ii, 0] = self._start
-            for jj in range(len(sents[ii])):
-                word = sents[ii][jj].lower()
-                if word in self._encodigs.word2int:
-                    x_words[ii, jj + 1] = self._encodigs.word2int[word]
+    def compute_encodings(self, dataset: Dataset, w_cutoff=7, ch_cutoff=7):
+        char2count = {}
+        token2count = {}
+        for example in dataset.sequences:
+            seq = example[0]
+            lang_id = example[1]
+            if lang_id + 1 > self._num_langs:
+                self._num_langs = lang_id + 1
+            for token in seq:
+                if token not in token2count:
+                    tk = token.lower()
+                    token2count[tk] = 1
                 else:
-                    x_words[ii, jj + 1] = self._unk
-            x_words[ii, len(sents[ii]) + 1] = self._end
-        x_words = torch.tensor(x_words, device=self._get_device(), dtype=torch.long)
-        return x_words, x_langs
+                    token2count[tk] += 1
+            for char in token:
+                ch = char.lower()
+                if ch not in char2count:
+                    char2count[ch] = 1
+                else:
+                    char2count[ch] += 1
+
+        self._char2int = {'<PAD>': 0, '<UNK>': 1}
+        self._token2int = {'<PAD>': 0, '<UNK>': 1}
+        for char in char2count:
+            if char2count[char] >= ch_cutoff:
+                self._char2int[char] = len(self._char2int)
+        for token in token2count:
+            if token2count[token] > w_cutoff:
+                self._token2int[token] = len(self._token2int)
+        self._word2target = {}
+        for lang_id in dataset.lang2cluster:
+            clusters = dataset.lang2cluster[lang_id]
+            self._word2target[lang_id] = {}
+            if len(clusters) > self._max_clusters:
+                self._max_clusters = len(clusters)
+            for cid in clusters:
+                cluster = clusters[cid]
+                if len(cluster) > self._max_words_in_clusters:
+                    self._max_words_in_clusters = len(cluster)
+                cnt = 0
+                for word in cluster:
+                    self._word2target[lang_id][word] = [cid, cnt]
+                    cnt += 1
+
+    def __str__(self):
+        w2t_count = 0
+        for lang_id in self._word2target:
+            w2t_count += len(self._word2target[lang_id])
+        result = "\t::Holistic tokens: {0}\n\t::Holistic chars: {1}\n\t::Max clusters: {2}\n\t::Max words in clusters: {3}\n\t::Languages: {4}\n\t::Known word targets: {5}".format(
+            len(self._token2int), len(self._char2int), self._max_clusters, self._max_words_in_clusters, self._num_langs,
+            w2t_count)
+        return result
+
+
+class SkipGram(nn.Module):
+    def __init__(self, encodings: Encodings):
+        super(SkipGram, self).__init__()
+        self._encodings = encodings
+        self._lang_emb = nn.Embedding(encodings._num_langs, 32)
+        self._tok_emb = nn.Embedding(len(encodings._char2int), 256)
+        self._case_emb = nn.Embedding(4, 32)
+        self._hmax_emb = nn.Embedding(encodings._max_clusters, 64)
+        self._conv = nn.Conv1d(256 + 32 + 32, 256, kernel_size=5)
+        self._rnn = nn.LSTM(256 + 32, 200, num_layers=1, batch_first=True)
+        self._output1 = nn.Linear(200 + 32, encodings._max_clusters)
+        self._output2 = nn.Linear(200 + 64, encodings._max_words_in_clusters)
+
+    def forward(self, words, langs, hmax=None):
+        x_char, x_case, x_lang, x_hmax = self._make_data(words, langs, hmax)
+
+        x_char = self._tok_emb(x_char)
+        x_case = self._case_emb(x_case)
+        x_lang = self._lang_emb(x_lang)
+
+        x = torch.cat([x_char, x_case, x_lang], dim=-1)
+        conv_out = self._conv(x.permute(0, 2, 1)).permute(0, 2, 1)
+        pre_rnn = torch.cat([conv_out, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1)], dim=-1)
+        rnn_out = self._rnn(pre_rnn)[0][:, -1, :]
+        if x_hmax != None:
+            pre_output1 = torch.cat([rnn_out, x_lang], dim=-1)
+            output1 = self._output1(pre_output1)
+            x_hmax = self._hmax_emb(x_hmax)
+            pre_output2 = torch.cat([rnn_out, x_hmax], dim=-1)
+            output2 = self._output2(pre_output2)
+            return output1, output2
+        else:
+            return rnn_out
 
     def _get_device(self):
         if self._word_lookup.weight.device.type == 'cpu':
@@ -119,137 +174,36 @@ class MLM(nn.Module):
         self.load_state_dict(torch.load(path, map_location='cpu'))
 
 
-def _make_batch(examples):
-    sents = []
-    langs = []
-    for example in examples:
-        langs.append(example[1])
-        sent = []
-        for token in example[0]:
-            sent.append(token.word)
-        sents.append(sent)
-    return sents, langs
-
-
 def _eval(model, dataset, encodings, criterion, word2bin):
     total_loss = 0
     model.eval()
-    with torch.no_grad():
-        num_batches = len(dataset.sequences) // params.batch_size
-        if len(dataset.sequences) % params.batch_size != 0:
-            num_batches += 1
-
-        import tqdm
-        pgb = tqdm.tqdm(range(num_batches), desc='\tevaluating loss=N/A', ncols=80)
-        for batch_idx in pgb:
-            start = batch_idx * params.batch_size
-            stop = min(len(dataset.sequences), start + params.batch_size)
-            sents, langs = _make_batch(dataset.sequences[start:stop])
-            y_pred = model(sents, langs, return_out=True)
-            y_tar = []
-            y_pred_list = []
-            for ii in range(len(sents)):
-                for jj in range(len(sents[ii])):
-                    word = sents[ii][jj].lower()
-                    if word in encodings.word2int:
-                        y_tar.append(word2bin[word])
-                        y_pred_list.append(y_pred[ii, jj, :].unsqueeze(0))
-            y_tar = torch.tensor(y_tar, device=params.device, dtype=torch.float)
-            y_pred = torch.cat(y_pred_list, dim=0)
-            loss = criterion(y_pred, y_tar)
-            total_loss += loss.item()
-            pgb.set_description('\tevaluating loss={0:.4f}'.format(loss.item()))
-
-        return total_loss / num_batches
-
-
-def _to_int(value):
-    t = 0
-    for ii in range(len(value)):
-        t += value[ii] * (2 ** ii)
-    return t
-
-
-def _to_bin(value, max_bin_size):
-    d = np.array([value])
-    rez = (((d[:, None] & (1 << np.arange(max_bin_size)))) > 0).astype(float)
-    return rez[0]
-
-
-def _prepare_vars(word_list):
-    word2int = {}
-    word2bin = {}
-    word2context = {}
-    bin_size = np.log(len(word_list))
-    if bin_size - int(bin_size) > 0:
-        bin_size += 1
-    bin_size = int(bin_size)
-
-    cnt = 0
-    for word in word_list:
-        word2int[word] = cnt
-        word2bin[word] = _to_bin(cnt, bin_size)
-        word2context[word] = {'TOTAL': 0, 'ctx': np.zeros((bin_size), dtype=np.float)}
-        cnt += 1
-    return word2int, word2bin, word2context
-
-
-def _reorder_words(model, dataset, word2ctx, encodings):
-    model.eval()
-    with torch.no_grad():
-        num_batches = len(dataset.sequences) // params.batch_size
-        if len(dataset.sequences) % params.batch_size != 0:
-            num_batches += 1
-
-        import tqdm
-        pgb = tqdm.tqdm(range(num_batches), desc='\tReordering words', ncols=80)
-        for batch_idx in pgb:
-            start = batch_idx * params.batch_size
-            stop = min(len(dataset.sequences), start + params.batch_size)
-            sents, langs = _make_batch(dataset.sequences[start:stop])
-            y_pred = model(sents, langs, return_out=True)
-            for ii in range(len(sents)):
-                for jj in range(len(sents[ii])):
-                    word = sents[ii][jj].lower()
-                    if word in encodings.word2int:
-                        word2ctx[word]['TOTAL'] += 1
-                        word2ctx[word]['ctx'] += y_pred[ii, jj, :].detach().cpu().numpy()
-
-                        # y_pred_list.append(y_pred[ii, jj, :].unsqueeze(0))
-
-            # pgb.set_description('\tloss={0:.4f}'.format(loss.item()))
-        word2int = {}
-        for word in word2ctx:
-            if word2ctx[word]['TOTAL'] > 0:
-                binary = word2ctx[word]['ctx'] / word2ctx[word]['TOTAL']
-            else:
-                binary = word2ctx[word]['ctx']
-            for ii in range(len(binary)):
-                if binary[ii] < 0.5:
-                    binary[ii] = 0
-                else:
-                    binary[ii] = 1
-            word2int[word] = _to_int(binary)
-        word_list = [k for k, _ in sorted(word2int.items(), key=lambda item: item[1])]
-        return word_list
+    return 0
 
 
 def do_train(params):
     ds_list = json.load(open(params.train_file))
     train_list = []
     dev_list = []
+    cluster_list = []
     for ii in range(len(ds_list)):
         train_list.append(ds_list[ii][1])
         dev_list.append(ds_list[ii][2])
+        cluster_list.append(ds_list[ii][3])
 
     trainset = Dataset()
     devset = Dataset()
+    sys.stdout.write('STEP 1: Loading data\n')
     for ii, train, dev in zip(range(len(train_list)), train_list, dev_list):
+        sys.stdout.write('\tLoading language {0}\n'.format(ii))
         trainset.load_dataset(train_list[ii], ii)
         devset.load_dataset(dev_list[ii], ii)
+        trainset.load_clusters(cluster_list[ii], ii)
 
+    sys.stdout.write('STEP 2: Computing encodings\n')
     encodings = Encodings()
-    # encodings.compute(trainset, devset, word_cutoff=2)
+    encodings.compute_encodings(trainset)
+    print(encodings)
+    sys.exit(0)
     config = MLMConfig()
     config.num_languages = len(train_list)
     if params.config_file:
@@ -272,7 +226,6 @@ def do_train(params):
     encodings.save('{0}.encodings'.format(params.store))
     model._config.save('{0}.conf'.format(params.store))
     word_list = [word for word in encodings.word2int]
-    word2int, word2bin, word2context = _prepare_vars(word_list)
 
     while patience_left > 0:
         patience_left -= 1
@@ -310,13 +263,6 @@ def do_train(params):
             pgb.set_description('\tloss={0:.4f}'.format(loss.item()))
 
         nll = _eval(model, devset, encodings, criterion, word2bin)
-        # if epoch % 20 == 0:
-        #     word_list = _reorder_words(model, trainset, word2context, encodings)
-        #     f = open('tmp.txt', 'w')
-        #     for w in word_list:
-        #         f.write(w + '\n')
-        #     f.close()
-        #     word2int, word2bin, word2context = _prepare_vars(word_list)
 
         sys.stdout.write('\tStoring {0}.last\n'.format(params.store))
         sys.stdout.flush()
@@ -352,8 +298,6 @@ if __name__ == '__main__':
                       help='Number of epochs before early stopping (default=32)')
     parser.add_option('--device', action='store', dest='device', default='cpu',
                       help='What device to use for models: cpu, cuda:0, cuda:1 ...')
-    parser.add_option('--max-vocab', action='store', dest='max_vocab_size', default=30000)
-    parser.add_option('--stop-words', action='store', dest='stop_words_file')
 
     (params, _) = parser.parse_args(sys.argv)
 
