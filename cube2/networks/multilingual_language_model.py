@@ -137,9 +137,15 @@ class SkipGram(nn.Module):
         self._case_emb = nn.Embedding(4, 32)
         self._hmax_emb = nn.Embedding(encodings._max_clusters, 64)
         self._conv = nn.Conv1d(256 + 32 + 32, 256, kernel_size=5)
-        self._rnn = nn.LSTM(256 + 32, 200, num_layers=1, batch_first=True)
-        self._output1 = nn.Linear(200 + 32, encodings._max_clusters)
-        self._output2 = nn.Linear(200 + 64, encodings._max_words_in_clusters)
+        self._rnn = nn.LSTM(256 + 32, 256, num_layers=1, batch_first=True)
+        self._output_h1 = nn.Linear(200 + 32, encodings._max_clusters)
+        self._output_w1 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h2 = nn.Linear(200 + 32, encodings._max_clusters)
+        self._output_w2 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h3 = nn.Linear(200 + 32, encodings._max_clusters)
+        self._output_w3 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h4 = nn.Linear(200 + 32, encodings._max_clusters)
+        self._output_w4 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
 
     def forward(self, words, langs, hmax=None):
         x_char, x_case, x_lang, x_hmax = self._make_data(words, langs, hmax)
@@ -153,12 +159,29 @@ class SkipGram(nn.Module):
         pre_rnn = torch.cat([conv_out, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1)], dim=-1)
         rnn_out = self._rnn(pre_rnn)[0][:, -1, :]
         if x_hmax != None:
-            pre_output1 = torch.cat([rnn_out, x_lang], dim=-1)
-            output1 = self._output1(pre_output1)
             x_hmax = self._hmax_emb(x_hmax)
-            pre_output2 = torch.cat([rnn_out, x_hmax], dim=-1)
-            output2 = self._output2(pre_output2)
-            return output1, output2
+
+            pre_output_h1 = torch.cat([rnn_out, x_lang], dim=-1)
+            output_h1 = self._output1(pre_output_h1)
+            pre_output_w1 = torch.cat([rnn_out, x_lang, x_hmax[:, 0, :]], dim=-1)
+            output_w1 = self._output2(pre_output_w1)
+
+            pre_output_h2 = torch.cat([rnn_out, x_lang], dim=-1)
+            output_h2 = self._output1(pre_output_h2)
+            pre_output_w2 = torch.cat([rnn_out, x_lang, x_hmax[:, 1, :]], dim=-1)
+            output_w2 = self._output2(pre_output_w2)
+
+            pre_output_h3 = torch.cat([rnn_out, x_lang], dim=-1)
+            output_h3 = self._output1(pre_output_h3)
+            pre_output_w3 = torch.cat([rnn_out, x_lang, x_hmax[:, 2, :]], dim=-1)
+            output_w3 = self._output2(pre_output_w3)
+
+            pre_output_h4 = torch.cat([rnn_out, x_lang], dim=-1)
+            output_h4 = self._output1(pre_output_h4)
+            pre_output_w4 = torch.cat([rnn_out, x_lang, x_hmax[:, 3, :]], dim=-1)
+            output_w4 = self._output2(pre_output_w4)
+
+            return output_h1, output_w1, output_h2, output_w2, output_h3, output_w3, output_h4, output_w4
         else:
             return rnn_out
 
