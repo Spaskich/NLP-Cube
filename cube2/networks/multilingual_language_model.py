@@ -70,7 +70,7 @@ class Encodings:
         self._token2int = json_obj['token2int']
         self._char2int = json_obj['char2int']
         self._num_langs = json_obj['num_langs']
-        self._word2target = json_obj['word2target']
+        self._word2target = json_obj['_word2target']
         self._max_clusters = json_obj['max_clusters']
         self._max_words_in_clusters = json_obj['max_words_in_clusters']
 
@@ -136,16 +136,16 @@ class SkipGram(nn.Module):
         self._tok_emb = nn.Embedding(len(encodings._char2int), 256)
         self._case_emb = nn.Embedding(4, 32)
         self._hmax_emb = nn.Embedding(encodings._max_clusters, 64)
-        self._conv = nn.Conv1d(256 + 32 + 32, 256, kernel_size=5)
+        self._conv = nn.Conv1d(256 + 32 + 32, 256, kernel_size=5, padding=2)
         self._rnn = nn.LSTM(256 + 32, 256, num_layers=1, batch_first=True)
-        self._output_h1 = nn.Linear(200 + 32, encodings._max_clusters)
-        self._output_w1 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
-        self._output_h2 = nn.Linear(200 + 32, encodings._max_clusters)
-        self._output_w2 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
-        self._output_h3 = nn.Linear(200 + 32, encodings._max_clusters)
-        self._output_w3 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
-        self._output_h4 = nn.Linear(200 + 32, encodings._max_clusters)
-        self._output_w4 = nn.Linear(200 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h1 = nn.Linear(256 + 32, encodings._max_clusters)
+        self._output_w1 = nn.Linear(256 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h2 = nn.Linear(256 + 32, encodings._max_clusters)
+        self._output_w2 = nn.Linear(256 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h3 = nn.Linear(256 + 32, encodings._max_clusters)
+        self._output_w3 = nn.Linear(256 + 64 + 32, encodings._max_words_in_clusters)
+        self._output_h4 = nn.Linear(256 + 32, encodings._max_clusters)
+        self._output_w4 = nn.Linear(256 + 64 + 32, encodings._max_words_in_clusters)
 
     def forward(self, words, langs, hmax=None):
         x_char, x_case, x_lang, x_hmax = self._make_data(words, langs, hmax)
@@ -154,7 +154,7 @@ class SkipGram(nn.Module):
         x_case = self._case_emb(x_case)
         x_lang = self._lang_emb(x_lang)
 
-        x = torch.cat([x_char, x_case, x_lang], dim=-1)
+        x = torch.cat([x_char, x_case, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1)], dim=-1)
         conv_out = self._conv(x.permute(0, 2, 1)).permute(0, 2, 1)
         pre_rnn = torch.cat([conv_out, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1)], dim=-1)
         rnn_out = self._rnn(pre_rnn)[0][:, -1, :]
@@ -162,33 +162,68 @@ class SkipGram(nn.Module):
             x_hmax = self._hmax_emb(x_hmax)
 
             pre_output_h1 = torch.cat([rnn_out, x_lang], dim=-1)
-            output_h1 = self._output1(pre_output_h1)
+            output_h1 = self._output_h1(pre_output_h1)
             pre_output_w1 = torch.cat([rnn_out, x_lang, x_hmax[:, 0, :]], dim=-1)
-            output_w1 = self._output2(pre_output_w1)
+            output_w1 = self._output_w1(pre_output_w1)
 
             pre_output_h2 = torch.cat([rnn_out, x_lang], dim=-1)
-            output_h2 = self._output1(pre_output_h2)
+            output_h2 = self._output_h2(pre_output_h2)
             pre_output_w2 = torch.cat([rnn_out, x_lang, x_hmax[:, 1, :]], dim=-1)
-            output_w2 = self._output2(pre_output_w2)
+            output_w2 = self._output_w2(pre_output_w2)
 
             pre_output_h3 = torch.cat([rnn_out, x_lang], dim=-1)
-            output_h3 = self._output1(pre_output_h3)
+            output_h3 = self._output_h3(pre_output_h3)
             pre_output_w3 = torch.cat([rnn_out, x_lang, x_hmax[:, 2, :]], dim=-1)
-            output_w3 = self._output2(pre_output_w3)
+            output_w3 = self._output_w3(pre_output_w3)
 
             pre_output_h4 = torch.cat([rnn_out, x_lang], dim=-1)
-            output_h4 = self._output1(pre_output_h4)
+            output_h4 = self._output_h4(pre_output_h4)
             pre_output_w4 = torch.cat([rnn_out, x_lang, x_hmax[:, 3, :]], dim=-1)
-            output_w4 = self._output2(pre_output_w4)
+            output_w4 = self._output_w4(pre_output_w4)
 
             return output_h1, output_w1, output_h2, output_w2, output_h3, output_w3, output_h4, output_w4
         else:
             return rnn_out
 
+    def _make_data(self, words, langs, hmax):
+        x_char = np.zeros((len(words), max([len(w) for w in words])))
+        x_case = np.zeros((x_char.shape[0], x_char.shape[1]))
+
+        for ii in range(x_char.shape[0]):
+            for jj in range(x_char.shape[1]):
+                if jj < len(words[ii]):
+                    ch = words[ii][jj].lower()
+                    if ch in self._encodings._char2int:
+                        x_char[ii, jj] = self._encodings._char2int[ch]
+                    else:
+                        x_char[ii, jj] = 1  # UNK
+                    if ch.lower() == ch.upper():
+                        x_case[ii, jj] = 1
+                    elif ch.lower() != ch:
+                        x_case[ii, jj] = 2
+                    else:
+                        x_case[ii, jj] = 3
+
+        x_char = np.copy(np.flip(x_char, axis=1))
+        x_case = np.copy(np.flip(x_case, axis=1))
+
+        x_langs = np.array(langs)
+        if hmax is not None:
+            x_hmax = np.array(hmax)
+            return torch.tensor(x_char, device=self._get_device(), dtype=torch.long), \
+                   torch.tensor(x_case, device=self._get_device(), dtype=torch.long), \
+                   torch.tensor(x_langs, device=self._get_device(), dtype=torch.long), \
+                   torch.tensor(x_hmax, device=self._get_device(), dtype=torch.long)
+        else:
+            return torch.tensor(x_char, device=self._get_device(), dtype=torch.long), \
+                   torch.tensor(x_case, device=self._get_device(), dtype=torch.long), \
+                   torch.tensor(x_langs, device=self._get_device(), dtype=torch.long), \
+                   None
+
     def _get_device(self):
-        if self._word_lookup.weight.device.type == 'cpu':
+        if self._lang_emb.weight.device.type == 'cpu':
             return 'cpu'
-        return '{0}:{1}'.format(self._word_lookup.weight.device.type, str(self._word_lookup.weight.device.index))
+        return '{0}:{1}'.format(self._lang_emb.weight.device.type, str(self._lang_emb.weight.device.index))
 
     def save(self, path):
         torch.save(self.state_dict(), path)
@@ -197,10 +232,120 @@ class SkipGram(nn.Module):
         self.load_state_dict(torch.load(path, map_location='cpu'))
 
 
-def _eval(model, dataset, encodings, criterion, word2bin):
+class SkipgramDataset:
+    def __init__(self, dataset: Dataset, encodings: Encodings):
+        self.dataset = dataset
+        self.encodings = encodings
+        self._seq_id = 0
+        self._word_id = -1
+        self._total_examples = 0
+        for ii in range(len(dataset.sequences)):
+            seq = dataset.sequences[ii][0]
+            self._total_examples += len(seq)
+
+    def get_count(self):
+        return self._total_examples
+
+    def shuffle(self):
+        random.shuffle(self.dataset.sequences)
+
+    def reset(self):
+        self._seq_id = 0
+        self._word_id = -1
+
+    def get_next_batch(self, batch_size=128):
+        x = []
+        y = []
+        l = []
+
+        while len(x) < batch_size and (
+                self._seq_id < len(self.dataset.sequences) or (self._word_id) < len(self.dataset.sequences[-1][0]) - 1):
+            self._word_id += 1
+            if self._word_id == len(self.dataset.sequences[self._seq_id][0]):
+                self._seq_id += 1
+                self._word_id = 0
+            if self._seq_id == len(self.dataset.sequences):
+                break
+            seq = self.dataset.sequences[self._seq_id][0]
+            word = seq[self._word_id]
+            y_t = []
+            lang_id = self.dataset.sequences[self._seq_id][1]
+            for ii in range(self._word_id - 2, self._word_id + 3):
+                if ii != self._word_id:
+                    if ii < 0 or ii >= len(seq):
+                        y_t.append([-1, -1])
+                    else:
+                        target_w = seq[ii].lower()
+                        if target_w not in self.encodings._word2target[lang_id]:
+                            y_t.append([-1, -1])
+                        else:
+                            y_t.append(self.encodings._word2target[lang_id][target_w])
+
+            x.append(word)
+            y.append(y_t)
+            l.append(lang_id)
+
+        return x, y, l
+
+
+def _eval(model, sdev, criterion, batch_size):
     total_loss = 0
     model.eval()
-    return 0
+    num_batches = sdev.get_count() // params.batch_size
+    if sdev.get_count() % params.batch_size != 0:
+        num_batches += 1
+    epoch_loss = 0
+    import tqdm
+    model.train()
+    pgb = tqdm.tqdm(range(num_batches), desc='\tevaluating', ncols=160)
+    for batch_idx in pgb:
+        x, y, l = sdev.get_next_batch(batch_size=batch_size)
+
+        hmax = np.zeros((len(x), 4), dtype=np.long)
+        for ii in range(len(x)):
+            for jj in range(4):
+                hm = y[ii][jj][0]
+                if hm != -1:
+                    hmax[ii, jj] = hm
+        oh1, ow1, oh2, ow2, oh3, ow3, oh4, ow4 = model(x, l, hmax=hmax)
+        h_p_list = []
+        w_p_list = []
+        h_t_list = []
+        w_t_list = []
+        for ii in range(len(x)):
+            if y[ii][0][0] != -1:
+                h_p_list.append(oh1[ii].unsqueeze(0))
+                w_p_list.append(ow1[ii].unsqueeze(0))
+                h_t_list.append(y[ii][0][0])
+                w_t_list.append(y[ii][0][1])
+            if y[ii][1][0] != -1:
+                h_p_list.append(oh2[ii].unsqueeze(0))
+                w_p_list.append(ow2[ii].unsqueeze(0))
+                h_t_list.append(y[ii][1][0])
+                w_t_list.append(y[ii][1][1])
+            if y[ii][2][0] != -1:
+                h_p_list.append(oh3[ii].unsqueeze(0))
+                w_p_list.append(ow3[ii].unsqueeze(0))
+                h_t_list.append(y[ii][2][0])
+                w_t_list.append(y[ii][2][1])
+            if y[ii][3][0] != -1:
+                h_p_list.append(oh4[ii].unsqueeze(0))
+                w_p_list.append(ow4[ii].unsqueeze(0))
+                h_t_list.append(y[ii][3][0])
+                w_t_list.append(y[ii][3][1])
+
+        if len(w_t_list) != 0:
+            h_p = torch.cat(h_p_list, dim=0)
+            w_p = torch.cat(w_p_list, dim=0)
+            h_t = torch.tensor(h_t_list, device=params.device, dtype=torch.long)
+            w_t = torch.tensor(w_t_list, device=params.device, dtype=torch.long)
+            loss_h = criterion(h_p, h_t)
+            loss_w = criterion(w_p, w_t)
+
+            loss = loss_w + loss_h
+            total_loss += loss.item()
+
+    return total_loss / num_batches
 
 
 def do_train(params):
@@ -226,20 +371,17 @@ def do_train(params):
     encodings = Encodings()
     encodings.compute_encodings(trainset)
     print(encodings)
-    sys.exit(0)
-    config = MLMConfig()
-    config.num_languages = len(train_list)
-    if params.config_file:
-        config.load(params.config_file)
-    # model = MLM(encodings, config)
-    model = None
-    # if params.device != 'cpu':
-    #     model.to(params.device)
+
+    strain = SkipgramDataset(trainset, encodings)
+    sdev = SkipgramDataset(devset, encodings)
+
+    model = SkipGram(encodings)
+    if params.device != 'cpu':
+        model.to(params.device)
 
     import torch.optim as optim
     import torch.nn as nn
-    # optimizer = optim.Adam(model.parameters(), lr=1e-4)  # , betas=(0.9, 0.9))
-    optimizer = None
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)  # , betas=(0.9, 0.9))
     criterion = nn.CrossEntropyLoss()
 
     patience_left = params.patience
@@ -247,56 +389,86 @@ def do_train(params):
 
     best_nll = 9999
     encodings.save('{0}.encodings'.format(params.store))
-    model._config.save('{0}.conf'.format(params.store))
-    word_list = [word for word in encodings.word2int]
-
+    # nll = _eval(model, sdev, criterion, params.batch_size)
     while patience_left > 0:
         patience_left -= 1
         sys.stdout.write('\n\nStarting epoch ' + str(epoch) + '\n')
         sys.stdout.flush()
         random.shuffle(trainset.sequences)
-        num_batches = len(trainset.sequences) // params.batch_size
-        if len(trainset.sequences) % params.batch_size != 0:
+        num_batches = strain.get_count() // params.batch_size
+        if strain.get_count() % params.batch_size != 0:
             num_batches += 1
-        total_words = 0
         epoch_loss = 0
         import tqdm
-        pgb = tqdm.tqdm(range(num_batches), desc='\tloss=NaN', ncols=80)
         model.train()
+        strain.shuffle()
+        pgb = tqdm.tqdm(range(num_batches), desc='\tloss=NaN h=N/A w=N/A', ncols=160)
         for batch_idx in pgb:
-            start = batch_idx * params.batch_size
-            stop = min(len(trainset.sequences), start + params.batch_size)
-            sents, langs = _make_batch(trainset.sequences[start:stop])
-            y_pred = model(sents, langs, return_out=True)
-            y_tar = []
-            y_pred_list = []
-            for ii in range(len(sents)):
-                for jj in range(len(sents[ii])):
-                    word = sents[ii][jj].lower()
-                    if word in encodings.word2int:
-                        y_tar.append(word2bin[word])
-                        y_pred_list.append(y_pred[ii, jj, :].unsqueeze(0))
-            y_tar = torch.tensor(y_tar, device=params.device, dtype=torch.float)
-            y_pred = torch.cat(y_pred_list, dim=0)
-            loss = criterion(y_pred, y_tar)
-            optimizer.zero_grad()
-            loss.backward()
-            epoch_loss += loss.item()
-            optimizer.step()
-            pgb.set_description('\tloss={0:.4f}'.format(loss.item()))
+            x, y, l = strain.get_next_batch(batch_size=params.batch_size)
 
-        nll = _eval(model, devset, encodings, criterion, word2bin)
+            hmax = np.zeros((len(x), 4), dtype=np.long)
+            for ii in range(len(x)):
+                for jj in range(4):
+                    hm = y[ii][jj][0]
+                    if hm != -1:
+                        hmax[ii, jj] = hm
+            oh1, ow1, oh2, ow2, oh3, ow3, oh4, ow4 = model(x, l, hmax=hmax)
+            h_p_list = []
+            w_p_list = []
+            h_t_list = []
+            w_t_list = []
+            for ii in range(len(x)):
+                if y[ii][0][0] != -1:
+                    h_p_list.append(oh1[ii].unsqueeze(0))
+                    w_p_list.append(ow1[ii].unsqueeze(0))
+                    h_t_list.append(y[ii][0][0])
+                    w_t_list.append(y[ii][0][1])
+                if y[ii][1][0] != -1:
+                    h_p_list.append(oh2[ii].unsqueeze(0))
+                    w_p_list.append(ow2[ii].unsqueeze(0))
+                    h_t_list.append(y[ii][1][0])
+                    w_t_list.append(y[ii][1][1])
+                if y[ii][2][0] != -1:
+                    h_p_list.append(oh3[ii].unsqueeze(0))
+                    w_p_list.append(ow3[ii].unsqueeze(0))
+                    h_t_list.append(y[ii][2][0])
+                    w_t_list.append(y[ii][2][1])
+                if y[ii][3][0] != -1:
+                    h_p_list.append(oh4[ii].unsqueeze(0))
+                    w_p_list.append(ow4[ii].unsqueeze(0))
+                    h_t_list.append(y[ii][3][0])
+                    w_t_list.append(y[ii][3][1])
 
-        sys.stdout.write('\tStoring {0}.last\n'.format(params.store))
+            if len(w_t_list) != 0:
+                h_p = torch.cat(h_p_list, dim=0)
+                w_p = torch.cat(w_p_list, dim=0)
+                h_t = torch.tensor(h_t_list, device=params.device, dtype=torch.long)
+                w_t = torch.tensor(w_t_list, device=params.device, dtype=torch.long)
+                loss_h = criterion(h_p, h_t)
+                loss_w = criterion(w_p, w_t)
+
+                loss = loss_w + loss_h
+                optimizer.zero_grad()
+                loss.backward()
+                epoch_loss += loss.item()
+                optimizer.step()
+                pgb.set_description(
+                    '\tloss={0:.4f} h={1:.4f} w={2:.4f}'.format(loss.item(), loss_w.item(), loss_h.item()))
+
+        strain.reset()
+        sdev.reset()
+        nll = _eval(model, sdev, criterion, params.batch_size)
+
+        sys.stdout.write('\tStoring {0}-skip.last\n'.format(params.store))
         sys.stdout.flush()
-        fn = '{0}.last'.format(params.store)
+        fn = '{0}-skip.last'.format(params.store)
         model.save(fn)
         sys.stderr.flush()
         if best_nll > nll:
             best_nll = nll
-            sys.stdout.write('\tStoring {0}.bestNLL\n'.format(params.store))
+            sys.stdout.write('\tStoring {0}-skip.bestNLL\n'.format(params.store))
             sys.stdout.flush()
-            fn = '{0}.bestNLL'.format(params.store)
+            fn = '{0}-skip.bestNLL'.format(params.store)
             model.save(fn)
             patience_left = params.patience
 
