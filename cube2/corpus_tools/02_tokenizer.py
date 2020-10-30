@@ -82,12 +82,17 @@ def _tokenize_file(params):
                     cw += ch
                 else:
                     if ct != 'W':
-                        if not is_stopword(cw):
-                            parts.append(cw)
+                        parts.append(cw)
                     cw = ch
                     ct = t
             if cw != '' and ct != 'W':
                 parts.append(cw)
+            if stopwords is not None:
+                new_parts = []
+                for part in parts:
+                    if not is_stopword(stopwords, part):
+                        new_parts.append(part)
+                parts = new_parts
             f_out.write(' '.join(parts) + '\n')
     f_out.close()
     f_in.close()
