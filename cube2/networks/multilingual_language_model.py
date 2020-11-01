@@ -207,35 +207,100 @@ class WordGram(nn.Module):
 
 
 class SkipgramDataset:
-    def __init__(self, dataset: Dataset, encodings: Encodings):
-        self.dataset = dataset
+    def __init__(self, dataset: Dataset, encodings: Encodings, win_size=2):
         self.encodings = encodings
-        self._seq_id = 0
         self._word_id = -1
-        self._total_examples = 0
         self._word_list = []
+        self._word2pos = []
+        self._word2int = {}
+        self._lang2widx = {}
+
         w_list = {}
         for ii in range(len(dataset.sequences)):
             seq = dataset.sequences[ii][0]
-            self._total_examples += len(seq)
+            lang_id = dataset.sequences[ii][1]
             for word in seq:
-                if word not in w_list:
-                    w_list[word] = 1
+                if (word, lang_id) not in w_list:
+                    w_list[(word, lang_id)] = 1
                 else:
-                    w_list[word] += 1
-        for w in w_list:
-            if w_list[w] >= 7:
-                self._word_list.append(w)
+                    w_list[(word, lang_id)] += 1
+        for (w, l) in w_list:
+            if w_list[(w, l)] >= 7:
+                self._word_list.append([w, l])
+                self._word2int[(w, l)] = len(self._word2int)
+                self._word2pos.append({})
+
+        for ii in range(len(dataset.sequences)):
+            seq = dataset.sequences[ii][0]
+            lang = dataset.sequences[ii][1]
+            for ii in range(len(seq)):
+                word = seq[ii]
+
+                if (word, lang) in self._word2int:
+                    w_index = self._word2int[(word, lang)]
+                    for jj in range(max(0, ii - win_size), min(len(seq) - 1, ii + win_size + 2)):
+                        if ii != jj:
+                            pos_list = self._word2pos[w_index]
+                            ww = seq[jj]
+                            if (ww, lang) in self._word2int:
+                                ww_index = self._word2int[(ww, lang)]
+                                if ww_index in pos_list:
+                                    pos_list[ww_index] += 1
+                                else:
+                                    pos_list[ww_index] = 1
+        # convert to probs
+        for w_index in range(len(self._word2pos)):
+            total = 0
+            for k in self._word2pos[w_index]:
+                total += self._word2pos[w_index][k]
+
+            for k in self._word2pos[w_index]:
+                self._word2pos[w_index][k] /= total
+
+        for w_index in range(len(self._word2pos)):
+            lang = self._word_list[w_index][1]
+            if lang not in self._lang2widx:
+                self._lang2widx[lang] = []
+            self._lang2widx[lang].append(w_index)
+
+        self._train_idx = list(range(len(self._word_list)))
 
     def get_count(self):
-        return self._total_examples
+        return len(self._word_list)
 
     def shuffle(self):
-        random.shuffle(self.dataset.sequences)
+        random.shuffle(self._train_idx)
 
     def reset(self):
-        self._seq_id = 0
         self._word_id = -1
+
+    def _sample_n(self, probs, n_samples):
+        if len(probs) == 0:
+            return []
+        pairs = []
+        curr = 0
+        for kk in probs:
+            p = probs[kk]
+            pairs.append((kk, curr, curr + p))
+            curr += p
+
+        samp = []
+        while (len(samp) < n_samples):
+            rnd = random.random()
+            for pair in pairs:
+                if rnd >= pair[1] and rnd <= pair[2]:
+                    samp.append(pair[0])
+                    break
+        return samp
+
+    def _neg_sample_n(self, probs, lang_word_idx, n_samples):
+        samp = []
+        n = len(lang_word_idx) - 1
+        while len(samp) < n_samples:
+            w_idx = lang_word_idx[random.randint(0, n)]
+            if w_idx not in probs:
+                samp.append(w_idx)
+        return samp
 
     def get_next_batch(self, batch_size=128):
         x = []
@@ -243,36 +308,19 @@ class SkipgramDataset:
         y_neg = []
         l = []
 
-        while len(x) < batch_size:
+        while len(x) < batch_size and self._word_id < len(self._word_list) - 1:
             self._word_id += 1
-            if self._seq_id >= len(self.dataset.sequences):
-                break
-            if self._word_id == len(self.dataset.sequences[self._seq_id][0]):
-                self._seq_id += 1
-                self._word_id = 0
-            if self._seq_id == len(self.dataset.sequences):
-                break
-            seq = self.dataset.sequences[self._seq_id][0]
-            word = seq[self._word_id]
-            lang_id = self.dataset.sequences[self._seq_id][1]
+            w_idx = self._train_idx[self._word_id]
+            word = self._word_list[w_idx][0]
+            lang_id = self._word_list[w_idx][1]
             x.append(word)
             l.append(lang_id)
-            y_t = []
-            # positive examples
-            for ii in range(self._word_id - 2, self._word_id + 3):
-                if ii != self._word_id:
-                    if ii >= 0 and ii < len(seq):
-                        y_t.append(seq[ii])
-            y_pos.append(y_t)
-            # negative examples
-            y_t2 = []
-            while len(y_t2) < 4:
-                index = random.randint(0, len(self._word_list) - 1)
-                word = self._word_list[index]
-                if word not in y_t:
-                    y_t2.append(word)
-            y_neg.append(y_t2)
+            y_t = self._sample_n(self._word2pos[w_idx], 4)
+            y_pos.append([self._word_list[ii][0] for ii in y_t])
 
+            # negative examples
+            y_t2 = self._neg_sample_n(self._word2pos[w_idx], self._lang2widx[lang_id], 4)
+            y_neg.append([self._word_list[ii][0] for ii in y_t2])
         return x, y_pos, y_neg, l
 
 
@@ -373,6 +421,8 @@ def do_train(params):
 
     strain = SkipgramDataset(trainset, encodings)
     sdev = SkipgramDataset(devset, encodings)
+    del trainset
+    del devset
 
     model = WordGram(encodings)
     if params.device != 'cpu':
