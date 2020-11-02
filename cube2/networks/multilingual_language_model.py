@@ -46,93 +46,58 @@ class Dataset:
         lines = open(filename).readlines()
         self.lang2cluster[lang_id] = {}
         for ii in tqdm(range(len(lines) // 4), desc='\t{0}'.format(filename), ncols=100):
-            self.lang2cluster[lang_id][ii] = lines[ii * 4 + 1].split(' ')
+            self.lang2cluster[lang_id][ii] = lines[ii * 4 + 1].strip().split(' ')
 
 
 class Encodings:
     def __init__(self, filename=None):
-        self._token2int = {}
+        # self._token2int = {}
         self._char2int = {}
         self._num_langs = 0
-        self._word2target = {}
-        self._max_clusters = 0
-        self._max_words_in_clusters = 0
         if filename is not None:
             self.load(filename)
 
     def save(self, filename):
-        json_obj = {'num_langs': self._num_langs, 'max_clusters': self._max_clusters,
-                    'max_words_in_clusters': self._max_words_in_clusters, 'token2int': self._token2int,
-                    'char2int': self._char2int, '_word2target': self._word2target}
+        json_obj = {'num_langs': self._num_langs,
+                    'char2int': self._char2int}
         json.dump(json_obj, open(filename, 'w'))
 
     def load(self, filename):
         json_obj = json.load(open(filename))
-        self._token2int = json_obj['token2int']
+        # self._token2int = json_obj['token2int']
         self._char2int = json_obj['char2int']
         self._num_langs = json_obj['num_langs']
-        self._word2target = json_obj['_word2target']
-        self._max_clusters = json_obj['max_clusters']
-        self._max_words_in_clusters = json_obj['max_words_in_clusters']
 
     def compute_encodings(self, dataset: Dataset, w_cutoff=7, ch_cutoff=7):
         char2count = {}
-        token2count = {}
         for example in dataset.sequences:
             seq = example[0]
             lang_id = example[1]
             if lang_id + 1 > self._num_langs:
                 self._num_langs = lang_id + 1
             for token in seq:
-                if token not in token2count:
-                    tk = token.lower()
-                    token2count[tk] = 1
-                else:
-                    token2count[tk] += 1
-            for char in token:
-                ch = char.lower()
-                if ch not in char2count:
-                    char2count[ch] = 1
-                else:
-                    char2count[ch] += 1
+                for char in token:
+                    ch = char.lower()
+                    if ch not in char2count:
+                        char2count[ch] = 1
+                    else:
+                        char2count[ch] += 1
 
         self._char2int = {'<PAD>': 0, '<UNK>': 1}
-        self._token2int = {'<PAD>': 0, '<UNK>': 1}
         for char in char2count:
             if char2count[char] >= ch_cutoff:
                 self._char2int[char] = len(self._char2int)
-        for token in token2count:
-            if token2count[token] > w_cutoff:
-                self._token2int[token] = len(self._token2int)
-        self._word2target = {}
-        for lang_id in dataset.lang2cluster:
-            clusters = dataset.lang2cluster[lang_id]
-            self._word2target[lang_id] = {}
-            if len(clusters) > self._max_clusters:
-                self._max_clusters = len(clusters)
-            for cid in clusters:
-                cluster = clusters[cid]
-                if len(cluster) > self._max_words_in_clusters:
-                    self._max_words_in_clusters = len(cluster)
-                cnt = 0
-                for word in cluster:
-                    self._word2target[lang_id][word] = [cid, cnt]
-                    cnt += 1
 
     def __str__(self):
-        w2t_count = 0
-        for lang_id in self._word2target:
-            w2t_count += len(self._word2target[lang_id])
-        result = "\t::Holistic tokens: {0}\n\t::Holistic chars: {1}\n\t::Max clusters: {2}\n\t::Max words in clusters: {3}\n\t::Languages: {4}\n\t::Known word targets: {5}".format(
-            len(self._token2int), len(self._char2int), self._max_clusters, self._max_words_in_clusters, self._num_langs,
-            w2t_count)
+        result = "\t::Holistic chars: {0}\n\t::Languages: {1}".format(
+            len(self._char2int), self._num_langs)
         return result
 
 
 class WordGram(nn.Module):
     def __init__(self, encodings: Encodings):
         super(WordGram, self).__init__()
-        NUM_FILTERS = 256
+        NUM_FILTERS = 512
         self._encodings = encodings
         self._lang_emb = nn.Embedding(encodings._num_langs, 32)
         self._tok_emb = nn.Embedding(len(encodings._char2int), 256)
@@ -160,8 +125,12 @@ class WordGram(nn.Module):
 
         x = torch.cat([x_char, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1), x_case], dim=-1)
         x = x.permute(0, 2, 1)
+        cnt = 0
         for conv in self._convolutions_char:
-            x = torch.dropout(torch.tanh(conv(x)), 0.5, False)
+            drop = self.training
+            if cnt >= len(self._convolutions_char):
+                drop = False
+            x = torch.dropout(torch.tanh(conv(x)), 0.1, drop)
         x = x.permute(0, 2, 1)
 
         return torch.sum(x, dim=1)
@@ -207,14 +176,16 @@ class WordGram(nn.Module):
 
 
 class SkipgramDataset:
-    def __init__(self, dataset: Dataset, encodings: Encodings, win_size=2):
+    def __init__(self, dataset: Dataset, encodings: Encodings, win_size=2, w_cutoff=7):
+        from pytreemap import TreeMap
         self.encodings = encodings
         self._word_id = -1
         self._word_list = []
         self._word2pos = []
         self._word2int = {}
         self._lang2widx = {}
-
+        sys.stdout.write("\t::Computing stats\n")
+        sys.stdout.flush()
         w_list = {}
         for ii in range(len(dataset.sequences)):
             seq = dataset.sequences[ii][0]
@@ -225,7 +196,7 @@ class SkipgramDataset:
                 else:
                     w_list[(word, lang_id)] += 1
         for (w, l) in w_list:
-            if w_list[(w, l)] >= 7:
+            if w_list[(w, l)] >= w_cutoff:
                 self._word_list.append([w, l])
                 self._word2int[(w, l)] = len(self._word2int)
                 self._word2pos.append({})
@@ -249,6 +220,8 @@ class SkipgramDataset:
                                 else:
                                     pos_list[ww_index] = 1
         # convert to probs
+        sys.stdout.write("\t::Converting to probs\n")
+        sys.stdout.flush()
         for w_index in range(len(self._word2pos)):
             total = 0
             for k in self._word2pos[w_index]:
@@ -256,6 +229,9 @@ class SkipgramDataset:
 
             for k in self._word2pos[w_index]:
                 self._word2pos[w_index][k] /= total
+
+        sys.stdout.write("\t::Computing lang lookups\n")
+        sys.stdout.flush()
 
         for w_index in range(len(self._word2pos)):
             lang = self._word_list[w_index][1]
@@ -418,9 +394,10 @@ def do_train(params):
     encodings = Encodings()
     encodings.compute_encodings(trainset)
     print(encodings)
-
-    strain = SkipgramDataset(trainset, encodings)
-    sdev = SkipgramDataset(devset, encodings)
+    encodings.save('{0}.encodings'.format(params.store))
+    sys.stdout.write('STEP 3: Building training and test data\n')
+    strain = SkipgramDataset(trainset, encodings, win_size=5)
+    sdev = SkipgramDataset(devset, encodings, win_size=3, w_cutoff=2)
     del trainset
     del devset
 
@@ -435,15 +412,13 @@ def do_train(params):
 
     patience_left = params.patience
     epoch = 1
-
+    sys.stdout.write('STEP 3: Starting training process\n')
     best_nll = 9999
-    encodings.save('{0}.encodings'.format(params.store))
     # nll = _eval(model, sdev, criterion, params.batch_size)
     while patience_left > 0:
         patience_left -= 1
         sys.stdout.write('\n\nStarting epoch ' + str(epoch) + '\n')
         sys.stdout.flush()
-        random.shuffle(trainset.sequences)
         num_batches = strain.get_count() // params.batch_size
         if strain.get_count() % params.batch_size != 0:
             num_batches += 1
