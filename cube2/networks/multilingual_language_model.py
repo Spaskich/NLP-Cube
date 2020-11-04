@@ -83,7 +83,7 @@ class Encodings:
                     else:
                         char2count[ch] += 1
 
-        self._char2int = {'<PAD>': 0, '<UNK>': 1}
+        self._char2int = {'<PAD>': 0, '<UNK>': 1, 'START': 2, 'STOP': 3}
         for char in char2count:
             if char2count[char] >= ch_cutoff:
                 self._char2int[char] = len(self._char2int)
@@ -98,6 +98,7 @@ class WordGram(nn.Module):
     def __init__(self, encodings: Encodings):
         super(WordGram, self).__init__()
         NUM_FILTERS = 512
+        self._num_filters = NUM_FILTERS
         self._encodings = encodings
         self._lang_emb = nn.Embedding(encodings._num_langs, 32)
         self._tok_emb = nn.Embedding(len(encodings._char2int), 256)
@@ -113,7 +114,7 @@ class WordGram(nn.Module):
                          dilation=1, w_init_gain='tanh'),
                 nn.BatchNorm1d(NUM_FILTERS))
             convolutions_char.append(conv_layer)
-            cs_inp = NUM_FILTERS
+            cs_inp = NUM_FILTERS // 2
         self._convolutions_char = nn.ModuleList(convolutions_char)
 
     def forward(self, words, langs):
@@ -126,33 +127,40 @@ class WordGram(nn.Module):
         x = torch.cat([x_char, x_lang.unsqueeze(1).repeat(1, x_case.shape[1], 1), x_case], dim=-1)
         x = x.permute(0, 2, 1)
         cnt = 0
+        half = self._num_filters // 2
         for conv in self._convolutions_char:
             drop = self.training
             if cnt >= len(self._convolutions_char):
                 drop = False
-            x = torch.dropout(torch.tanh(conv(x)), 0.1, drop)
+            conv_out = conv(x)
+            tmp = torch.tanh(conv_out[:, :half, :]) * torch.sigmoid((conv_out[:, half:, :]))
+            x = torch.dropout(tmp, 0.1, drop)
         x = x.permute(0, 2, 1)
 
         return torch.sum(x, dim=1)
 
     def _make_data(self, words, langs):
-        x_char = np.zeros((len(words), max([len(w) for w in words])))
+        x_char = np.zeros((len(words), max([len(w) for w in words]) + 2))
         x_case = np.zeros((x_char.shape[0], x_char.shape[1]))
 
         for ii in range(x_char.shape[0]):
+            x_char[ii, 0] = 2
+            x_case[ii, 0] = 1
+            x_char[ii, len(words[ii]) + 1] = 3
+            x_case[ii, len(words[ii]) + 1] = 1
             for jj in range(x_char.shape[1]):
                 if jj < len(words[ii]):
                     ch = words[ii][jj].lower()
                     if ch in self._encodings._char2int:
-                        x_char[ii, jj] = self._encodings._char2int[ch]
+                        x_char[ii, jj + 1] = self._encodings._char2int[ch]
                     else:
-                        x_char[ii, jj] = 1  # UNK
+                        x_char[ii, jj + 1] = 1  # UNK
                     if ch.lower() == ch.upper():
-                        x_case[ii, jj] = 1
+                        x_case[ii, jj + 1] = 1
                     elif ch.lower() != ch:
-                        x_case[ii, jj] = 2
+                        x_case[ii, jj + 1] = 2
                     else:
-                        x_case[ii, jj] = 3
+                        x_case[ii, jj + 1] = 3
 
         x_char = np.copy(np.flip(x_char, axis=1))
         x_case = np.copy(np.flip(x_case, axis=1))
