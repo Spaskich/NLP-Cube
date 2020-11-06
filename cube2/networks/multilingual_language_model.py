@@ -185,7 +185,7 @@ class WordGram(nn.Module):
 
 class SkipgramDataset:
     def __init__(self, dataset: Dataset, encodings: Encodings, win_size=2, w_cutoff=7):
-        from pytreemap import TreeMap
+        from cube2.networks.alg import FlatMap
         self.encodings = encodings
         self._word_id = -1
         self._word_list = []
@@ -203,41 +203,73 @@ class SkipgramDataset:
                     w_list[(word, lang_id)] = 1
                 else:
                     w_list[(word, lang_id)] += 1
+
+        targets = []
         for (w, l) in w_list:
             if w_list[(w, l)] >= w_cutoff:
                 self._word_list.append([w, l])
                 self._word2int[(w, l)] = len(self._word2int)
-                self._word2pos.append({})
+                self._word2pos.append(FlatMap())
+                targets.append([])
 
-        for ii in range(len(dataset.sequences)):
+        for ii in tqdm(range(len(dataset.sequences)), desc="\t\t", ncols=80):
             seq = dataset.sequences[ii][0]
             lang = dataset.sequences[ii][1]
             for ii in range(len(seq)):
                 word = seq[ii]
 
                 if (word, lang) in self._word2int:
-                    w_index = self._word2int[(word, lang)]
-                    for jj in range(max(0, ii - win_size), min(len(seq) - 1, ii + win_size + 2)):
-                        if ii != jj:
-                            pos_list = self._word2pos[w_index]
-                            ww = seq[jj]
-                            if (ww, lang) in self._word2int:
-                                ww_index = self._word2int[(ww, lang)]
-                                if ww_index in pos_list:
-                                    pos_list[ww_index] += 1
-                                else:
-                                    pos_list[ww_index] = 1
+                    w_index1 = self._word2int[(word, lang)]
+                    for jj in range(ii + 1, min(len(seq) - 1, ii + win_size + 2)):
+                        ww = seq[jj]
+                        if (ww, lang) in self._word2int:
+                            w_index2 = self._word2int[(ww, lang)]
+                            source = w_index1
+                            dest = w_index2
+                            if w_index2 < w_index1:
+                                source = w_index2
+                                dest = w_index1
+                            targets[source].append(dest)
+
         # convert to probs
         sys.stdout.write("\t::Converting to probs\n")
         sys.stdout.flush()
-        for w_index in range(len(self._word2pos)):
+        self._train_idx = []
+        for w_index in tqdm(range(len(targets)), desc="\t\t", ncols=80):
+            tgt_list = list(sorted(targets[w_index]))
+            occ = [1]
+            for ii in range(1, len(tgt_list)):
+                if tgt_list[ii] == tgt_list[ii - 1]:
+                    occ.append(occ[-1] + 1)
+                else:
+                    occ.append(1)
+
+            new_targets = []
+            new_occ = []
             total = 0
-            for k in self._word2pos[w_index]:
-                total += self._word2pos[w_index][k]
+            for ii in range(len(tgt_list)):
+                if ii == len(tgt_list) - 1 or occ[ii] >= occ[ii + 1]:
+                    new_targets.append(tgt_list[ii])
+                    new_occ.append(occ[ii])
+                    total += new_occ[-1]
+            for ii in range(len(new_occ)):
+                new_occ[ii] = new_occ[ii] / total
 
-            for k in self._word2pos[w_index]:
-                self._word2pos[w_index][k] /= total
+            del tgt_list
+            del occ
+            last_prob = 0
+            for ii in range(len(new_occ)):
+                # if new_occ[ii] > 0.01:
+                fm = self._word2pos[w_index]
+                fm._keys.append(new_targets[ii])
+                fm._objects.append(new_occ[ii] + last_prob)
+                last_prob += new_occ[ii]
+            if len(new_occ) > 0:
+                self._train_idx.append(w_index)
+            del new_targets
+            del new_occ
 
+        del targets
         sys.stdout.write("\t::Computing lang lookups\n")
         sys.stdout.flush()
 
@@ -247,10 +279,8 @@ class SkipgramDataset:
                 self._lang2widx[lang] = []
             self._lang2widx[lang].append(w_index)
 
-        self._train_idx = list(range(len(self._word_list)))
-
     def get_count(self):
-        return len(self._word_list)
+        return len(self._train_idx)
 
     def shuffle(self):
         random.shuffle(self._train_idx)
@@ -258,23 +288,30 @@ class SkipgramDataset:
     def reset(self):
         self._word_id = -1
 
-    def _sample_n(self, probs, n_samples):
-        if len(probs) == 0:
-            return []
-        pairs = []
-        curr = 0
-        for kk in probs:
-            p = probs[kk]
-            pairs.append((kk, curr, curr + p))
-            curr += p
+    def _pos_sample_n(self, probs, n_samples):
+
+        def _get_item(keys, probs, prob):
+            start = 0
+            end = len(keys) - 1
+            while start < end:
+                mid = (start + end) // 2
+                max_prob = probs[mid]
+                min_prob = 0
+                if mid > 0:
+                    min_prob = probs[mid - 1]
+                if min_prob <= prob and max_prob >= prob:
+                    return keys[mid]
+
+                if max_prob <= prob:
+                    start = mid + 1
+                if min_prob >= prob:
+                    end = mid - 1
+            return keys[0]
 
         samp = []
         while (len(samp) < n_samples):
             rnd = random.random()
-            for pair in pairs:
-                if rnd >= pair[1] and rnd <= pair[2]:
-                    samp.append(pair[0])
-                    break
+            samp.append(_get_item(probs._keys, probs._objects, rnd))
         return samp
 
     def _neg_sample_n(self, probs, lang_word_idx, n_samples):
@@ -292,14 +329,14 @@ class SkipgramDataset:
         y_neg = []
         l = []
 
-        while len(x) < batch_size and self._word_id < len(self._word_list) - 1:
+        while len(x) < batch_size and self._word_id < len(self._train_idx) - 1:
             self._word_id += 1
             w_idx = self._train_idx[self._word_id]
             word = self._word_list[w_idx][0]
             lang_id = self._word_list[w_idx][1]
             x.append(word)
             l.append(lang_id)
-            y_t = self._sample_n(self._word2pos[w_idx], 4)
+            y_t = self._pos_sample_n(self._word2pos[w_idx], 4)
             y_pos.append([self._word_list[ii][0] for ii in y_t])
 
             # negative examples
