@@ -220,16 +220,17 @@ class SkipgramDataset:
 
                 if (word, lang) in self._word2int:
                     w_index1 = self._word2int[(word, lang)]
-                    for jj in range(ii + 1, min(len(seq) - 1, ii + win_size + 2)):
-                        ww = seq[jj]
-                        if (ww, lang) in self._word2int:
-                            w_index2 = self._word2int[(ww, lang)]
-                            source = w_index1
-                            dest = w_index2
-                            if w_index2 < w_index1:
-                                source = w_index2
-                                dest = w_index1
-                            targets[source].append(dest)
+                    for jj in range(max(0, ii - win_size), min(len(seq) - 1, ii + win_size + 2)):
+                        if ii != jj:
+                            ww = seq[jj]
+                            if (ww, lang) in self._word2int:
+                                w_index2 = self._word2int[(ww, lang)]
+                                source = w_index1
+                                dest = w_index2
+                                # if w_index2 < w_index1:
+                                #     source = w_index2
+                                #     dest = w_index1
+                                targets[source].append(dest)
 
         # convert to probs
         sys.stdout.write("\t::Converting to probs\n")
@@ -268,6 +269,8 @@ class SkipgramDataset:
                 self._train_idx.append(w_index)
             del new_targets
             del new_occ
+            del targets[w_index]
+            targets[w_index] = []
 
         del targets
         sys.stdout.write("\t::Computing lang lookups\n")
