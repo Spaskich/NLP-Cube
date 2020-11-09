@@ -35,6 +35,7 @@ class Dataset:
     def __init__(self):
         self.sequences = []
         self.lang2cluster = {}
+        self.equivalents = {}
 
     def load_dataset(self, filename, lang_id):
         lines = open(filename).readlines()
@@ -42,11 +43,39 @@ class Dataset:
             parts = line.strip().split(' ')
             self.sequences.append([parts, lang_id])
 
-    def load_clusters(self, filename, lang_id):
-        lines = open(filename).readlines()
-        self.lang2cluster[lang_id] = {}
-        for ii in tqdm(range(len(lines) // 4), desc='\t{0}'.format(filename), ncols=100):
-            self.lang2cluster[lang_id][ii] = lines[ii * 4 + 1].strip().split(' ')
+    def load_dict(self, src, dst, file):
+        f = open(file)
+        for line in f.readlines():
+            line = line.strip()
+            if not line.startswith("#"):
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    print(line)
+                    continue
+                src_words = parts[0].split(';')
+                dst_words = parts[1].split(';')
+                for w_src in src_words:
+                    w_src = w_src.strip()
+                    if ' ' not in w_src:
+                        if (w_src, src) not in self.equivalents:
+                            self.equivalents[(w_src, src)] = []
+                        lst = self.equivalents[(w_src, src)]
+                        for w_dst in dst_words:
+                            w_dst = w_dst.strip()
+                            if ' ' not in w_dst:
+                                lst.append((w_dst, dst))
+                for w_src in dst_words:
+                    w_src = w_src.strip()
+                    if ' ' not in w_src:
+                        if (w_src, dst) not in self.equivalents:
+                            self.equivalents[(w_src, dst)] = []
+                        lst = self.equivalents[(w_src, dst)]
+                        for w_dst in src_words:
+                            w_dst = w_dst.strip()
+                            if ' ' not in w_dst:
+                                lst.append((w_dst, src))
+
+        f.close()
 
 
 class Encodings:
@@ -136,8 +165,8 @@ class WordGram(nn.Module):
             tmp = torch.tanh(conv_out[:, :half, :]) * torch.sigmoid((conv_out[:, half:, :]))
             x = torch.dropout(tmp, 0.1, drop)
         x = x.permute(0, 2, 1)
-
-        return torch.sum(x, dim=1)
+        # scaled tanh output - avoids -inf/nan loss
+        return 5.0 * torch.tanh(torch.sum(x, dim=1))
 
     def _make_data(self, words, langs):
         x_char = np.zeros((len(words), max([len(w) for w in words]) + 2))
@@ -192,6 +221,7 @@ class SkipgramDataset:
         self._word2pos = []
         self._word2int = {}
         self._lang2widx = {}
+        self._equivalents = dataset.equivalents
         sys.stdout.write("\t::Computing stats\n")
         sys.stdout.flush()
         w_list = {}
@@ -269,7 +299,7 @@ class SkipgramDataset:
                 self._train_idx.append(w_index)
             del new_targets
             del new_occ
-            del targets[w_index]
+
             targets[w_index] = []
 
         del targets
@@ -329,6 +359,7 @@ class SkipgramDataset:
     def get_next_batch(self, batch_size=128):
         x = []
         y_pos = []
+        y_pos_t = []
         y_neg = []
         l = []
 
@@ -341,11 +372,19 @@ class SkipgramDataset:
             l.append(lang_id)
             y_t = self._pos_sample_n(self._word2pos[w_idx], 4)
             y_pos.append([self._word_list[ii][0] for ii in y_t])
+            if (word, lang_id) in self._equivalents:
+                y_pos_t.append(self._equivalents[(word, lang_id)])
+            else:
+                y_pos_t.append([])
 
             # negative examples
             y_t2 = self._neg_sample_n(self._word2pos[w_idx], self._lang2widx[lang_id], 4)
             y_neg.append([self._word_list[ii][0] for ii in y_t2])
-        return x, y_pos, y_neg, l
+        return x, y_pos, y_pos_t, y_neg, l
+
+
+def log1pexp(x):
+    return torch.where(x < 50, torch.log1p(torch.exp(x)), x)
 
 
 def _eval(model, sdev, criterion, batch_size):
@@ -359,7 +398,7 @@ def _eval(model, sdev, criterion, batch_size):
     model.train()
     pgb = tqdm.tqdm(range(num_batches), desc='\tevaluating', ncols=160)
     for batch_idx in pgb:
-        x, y_pos, y_neg, l = sdev.get_next_batch(batch_size=batch_size)
+        x, y_pos, y_pos_t, y_neg, l = sdev.get_next_batch(batch_size=batch_size)
         x2pos = {}
         x2neg = {}
         words = []
@@ -379,6 +418,10 @@ def _eval(model, sdev, criterion, batch_size):
                 x2neg[w_index].append(len(words))
                 words.append(ww)
                 langs.append(l[cnt])
+            for (ww, l_id) in y_pos_t[cnt]:
+                x2pos[w_index].append(len(words))
+                words.append(ww)
+                langs.append(l_id)
 
             w_index = len(words)
             cnt += 1
@@ -396,7 +439,7 @@ def _eval(model, sdev, criterion, batch_size):
         pos_list = torch.cat(pos_list, dim=0)
         tmp = x_list * pos_list
         tmp = torch.mean(tmp, dim=1)
-        tmp = torch.log(1 + torch.exp(-tmp))
+        tmp = log1pexp(-tmp)  # torch.log(1 + torch.exp(-tmp))
         loss_pos = tmp.mean()
 
         x_list = []
@@ -410,7 +453,7 @@ def _eval(model, sdev, criterion, batch_size):
         neg_list = torch.cat(neg_list, dim=0)
         tmp = x_list * neg_list
         tmp = torch.mean(tmp, dim=1)
-        tmp = torch.log(1 + torch.exp(tmp))
+        tmp = log1pexp(tmp)  # torch.log(1 + torch.exp(tmp))
         loss_neg = tmp.mean()
 
         loss = loss_pos + loss_neg
@@ -420,14 +463,15 @@ def _eval(model, sdev, criterion, batch_size):
 
 
 def do_train(params):
-    ds_list = json.load(open(params.train_file))
+    training_conf = json.load(open(params.train_file))
+    ds_list = training_conf['langs']
     train_list = []
     dev_list = []
-    cluster_list = []
+    lang2id = {}
     for ii in range(len(ds_list)):
         train_list.append(ds_list[ii][1])
         dev_list.append(ds_list[ii][2])
-        cluster_list.append(ds_list[ii][3])
+        lang2id[ds_list[ii][0]] = len(lang2id)
 
     trainset = Dataset()
     devset = Dataset()
@@ -436,7 +480,13 @@ def do_train(params):
         sys.stdout.write('\tLoading language {0}\n'.format(ii))
         trainset.load_dataset(train_list[ii], ii)
         devset.load_dataset(dev_list[ii], ii)
-        trainset.load_clusters(cluster_list[ii], ii)
+
+    dicts = training_conf['dicts']
+    for dict in dicts:
+        l_src = lang2id[dict[0]]
+        l_dst = lang2id[dict[1]]
+        file = dict[2]
+        trainset.load_dict(l_src, l_dst, file)
 
     sys.stdout.write('STEP 2: Computing encodings\n')
     encodings = Encodings()
@@ -445,7 +495,7 @@ def do_train(params):
     encodings.save('{0}.encodings'.format(params.store))
     sys.stdout.write('STEP 3: Building training and test data\n')
     strain = SkipgramDataset(trainset, encodings, win_size=5)
-    sdev = SkipgramDataset(devset, encodings, win_size=3, w_cutoff=2)
+    sdev = SkipgramDataset(devset, encodings, win_size=5, w_cutoff=2)
     del trainset
     del devset
 
@@ -476,7 +526,7 @@ def do_train(params):
         strain.shuffle()
         pgb = tqdm.tqdm(range(num_batches), desc='\tloss=NaN h=N/A w=N/A', ncols=160)
         for batch_idx in pgb:
-            x, y_pos, y_neg, l = strain.get_next_batch(batch_size=params.batch_size)
+            x, y_pos, y_pos_t, y_neg, l = strain.get_next_batch(batch_size=params.batch_size)
             x2pos = {}
             x2neg = {}
             words = []
@@ -497,6 +547,11 @@ def do_train(params):
                     words.append(ww)
                     langs.append(l[cnt])
 
+                for (ww, l_id) in y_pos_t[cnt]:
+                    x2pos[w_index].append(len(words))
+                    words.append(ww)
+                    langs.append(l_id)
+
                 w_index = len(words)
                 cnt += 1
 
@@ -513,7 +568,7 @@ def do_train(params):
             pos_list = torch.cat(pos_list, dim=0)
             tmp = x_list * pos_list
             tmp = torch.mean(tmp, dim=1)
-            tmp = torch.log(1 + torch.exp(-tmp))
+            tmp = log1pexp(-tmp)  # torch.log(1 + torch.exp(-tmp))
             loss_pos = tmp.mean()
 
             x_list = []
@@ -527,7 +582,7 @@ def do_train(params):
             neg_list = torch.cat(neg_list, dim=0)
             tmp = x_list * neg_list
             tmp = torch.mean(tmp, dim=1)
-            tmp = torch.log(1 + torch.exp(tmp))
+            tmp = log1pexp(tmp)  # torch.log(1 + torch.exp(tmp))
             loss_neg = tmp.mean()
 
             loss = loss_pos + loss_neg
